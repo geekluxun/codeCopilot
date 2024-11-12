@@ -10,12 +10,19 @@ import os
 import torch
 import torch.nn.functional as F
 import math
+import json
 
+os.environ["WANDB_MODE"] = "offline"  # 设置为离线模式
+os.environ["WANDB_DIR"] = "wandb"
+os.environ["WANDB_CACHE_DIR"] = "wandb"
 
 # 本地模型路径
 model_local_path = '/mnt/workspace/me/Qwen2.5-0.5B-Instruct/Qwen2.5-0.5B-Instruct/'
 # 本地数据集路径
 dataset_local_path = '/mnt/workspace/me/CodeAlpaca-20k/'
+# 检查点路径
+checkpoint_path = "results/checkpoint-613"
+
 # 最长序列
 max_length = 1024
 
@@ -23,27 +30,9 @@ max_length = 1024
 tokenizer = AutoTokenizer.from_pretrained(model_local_path)
 # 加载数据集
 dataset = load_dataset(dataset_local_path)
-train_val_dataset = dataset["train"].train_test_split(test_size=0.1, shuffle=True, seed=42)
+train_val_dataset = dataset["train"].train_test_split(test_size=0.02, shuffle=True, seed=42)
 
 
-# def preprocess_function(examples):
-#     model_inputs = tokenizer(
-#         examples["prompt"],
-#         max_length=max_length,
-#         padding="longest",
-#         truncation=True,
-#         return_tensors="pt"
-#     )
-#
-#     labels = tokenizer(
-#         examples["completion"],
-#         max_length=max_length,
-#         padding="longest",
-#         truncation=True,
-#         return_tensors="pt"
-#     )
-#     model_inputs['labels'] = labels['input_ids']
-#     return model_inputs
 def preprocess_function(examples):
     # 组合 instruction 和 input 作为提示语
     prompts = []
@@ -89,9 +78,9 @@ val_dataset = train_val_dataset["test"].map(preprocess_function, batched=True)
 
 # lora配置
 lora_config = LoraConfig(
-    r=16,
+    r=32,
     lora_alpha=32,
-    target_modules=["q_proj", "v_proj"],
+    target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
     lora_dropout=0.1,
     bias="none",
     task_type="CAUSAL_LM"
@@ -106,46 +95,75 @@ early_stopping = EarlyStoppingCallback(
 # DeepSpeed 训练参数
 local_rank = int(os.getenv('LOCAL_RANK', '0'))
 
+
+def calculate_eval_steps(train_dataset, training_args, n_gpus):
+    # 计算实际的总批次大小
+    total_batch_size = (
+            training_args.per_device_train_batch_size *  # 每个GPU的批次大小
+            training_args.gradient_accumulation_steps *  # 梯度累积步数
+            n_gpus  # GPU数量
+    )
+
+    # 计算多少步才能遍历完整个数据集
+    steps_per_epoch = len(train_dataset) // total_batch_size
+
+    # 设置评估间隔为数据集的1/10，但不少于100步
+    eval_steps = max(steps_per_epoch // 10, 100)
+
+    return eval_steps
+
+
+#
+n_gpus = torch.cuda.device_count()  # 获取可用GPU数量
+
 training_args = TrainingArguments(
-    num_train_epochs=3,
-    learning_rate=1e-5,
-    lr_scheduler_type='linear',
-    warmup_ratio=0.1,
-    per_device_train_batch_size=2,
-    per_device_eval_batch_size=2,
-    weight_decay=0.01,
+    # 输出和保存相关
+    output_dir='./results',  # 输出目录
+    overwrite_output_dir=True,  # 允许覆盖输出目录
 
-    # DeepSpeed specific
-    deepspeed="ds_config.json",  # DeepSpeed配置文件路径
-    local_rank=local_rank,  # 本地进程序号
+    # 训练基本配置
+    num_train_epochs=3,  # 训练轮数
+    per_device_train_batch_size=4,  # 每个GPU的批次大小
+    per_device_eval_batch_size=4,  # 评估时的批次大小
+    gradient_accumulation_steps=16,  # 梯度累积步数
 
-    # 优化相关
-    gradient_checkpointing=False,
-    fp16=True,
-    gradient_accumulation_steps=4,
-
-    # 日志相关
-    log_level='debug',
-    logging_dir='./logs',
-    logging_steps=500,
-
-    # 评估相关
-    evaluation_strategy="steps",
+    # 评估策略
+    evaluation_strategy="steps",  # 按步数进行评估
     eval_steps=500,
-    metric_for_best_model="eval_loss",
+    eval_accumulation_steps=4,  # 评估时的梯度累积
 
-    # checkpoint相关
-    output_dir='./results',
-    save_strategy="steps",
-    save_steps=2_000,
-    save_total_limit=2,
-    load_best_model_at_end=True,
+    # 保存策略
+    save_strategy="steps",  # 按步数保存
+    save_steps=500,  # 保存间隔
+    save_total_limit=3,  # 最多保存几个检查点
 
-    # 其他
-    remove_unused_columns=True,
-    dataloader_drop_last=True,
-    disable_tqdm=False,
+    # 日志和监控
+    logging_dir='./logs',  # 日志目录
+    logging_strategy="steps",  # 按步数记录日志
+    logging_steps=100,  # 日志记录间隔
+    report_to=["tensorboard"],  # 使用tensorboard记录
+
+    # 性能优化
+    fp16=True,  # 启用混合精度
+    dataloader_num_workers=4,  # 数据加载的线程数
+
+    # 其他训练参数
+    remove_unused_columns=True,  # 删除未使用的列以节省内存
+    disable_tqdm=False,  # 显示进度条
+    load_best_model_at_end=True,  # 训练结束时加载最佳模型
+    metric_for_best_model="loss",  # 用loss作为最佳模型的指标
+    greater_is_better=False,  # loss越小越好
+
+    # 分布式训练
+    deepspeed="ds_config.json",  # DeepSpeed配置文件路径
+    local_rank=-1,  # 本地进程号，由DeepSpeed自动设置
+
+    # 早停策略
+    early_stopping_patience=3,  # 早停耐心值
+    early_stopping_threshold=0.01,  # 早停阈值
 )
+
+training_args.eval_steps = calculate_eval_steps(train_dataset, training_args, n_gpus)
 
 
 def print_gpu_utilization():
@@ -159,9 +177,6 @@ def print_summary(result):
     print(f"Time: {result.metrics['train_runtime']:.2f}")
     print(f"Samples/second: {result.metrics['train_samples_per_second']:.2f}")
     print_gpu_utilization()
-
-
-
 
 
 def compute_perplexity(logits, labels, ignore_index=-100):
@@ -259,14 +274,18 @@ trainer = Trainer(
     model=model,
     args=training_args,
     train_dataset=train_dataset,
-    eval_dataset=val_dataset,
+    # eval_dataset=val_dataset,
     data_collator=data_collator,
-    compute_metrics=compute_metrics,
-    callbacks=[early_stopping],
+    # compute_metrics=compute_metrics,
+    # callbacks=[early_stopping],
 )
 
+# 4. 保存训练配置以便复现
+with open('config/training_config.json', 'w') as f:
+    json.dump(training_args.to_dict(), f, indent=2)
+
 # 开始微调
-result = trainer.train()
+result = trainer.train(resume_from_checkpoint=checkpoint_path)
 
 # 只在主进程上打印汇总信息和保存模型
 if local_rank == 0:

@@ -7,6 +7,10 @@ export MASTER_ADDR=localhost  # master地址
 export WORLD_SIZE=1  # 总进程数（GPU数量）
 export NODE_RANK=0  # 当前节点的rank
 export LOCAL_RANK=0  # 本地rank
+export WANDB_DISABLED=TRUE  # 是否使用wandb
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+
 
 # 创建必要的目录
 mkdir -p logs
