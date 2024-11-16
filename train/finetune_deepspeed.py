@@ -1,16 +1,13 @@
-from transformers import AutoTokenizer, Trainer, TrainingArguments, AutoModelForCausalLM, DataCollatorWithPadding
+import json
+import math
+import os
+
+import torch
 from datasets import load_dataset
 from peft import LoraConfig, get_peft_model
-import evaluate
-import torch
 from pynvml import *
+from transformers import AutoTokenizer, Trainer, TrainingArguments, AutoModelForCausalLM, DataCollatorWithPadding
 from transformers import EarlyStoppingCallback
-import deepspeed
-import os
-import torch
-import torch.nn.functional as F
-import math
-import json
 
 os.environ["WANDB_MODE"] = "offline"  # 设置为离线模式
 os.environ["WANDB_DIR"] = "wandb"
@@ -74,7 +71,7 @@ def preprocess_function(examples):
 
 # 应用预处理
 train_dataset = train_val_dataset["train"].map(preprocess_function, batched=True)
-val_dataset = train_val_dataset["test"].map(preprocess_function, batched=True)
+val_dataset = train_val_dataset["demo"].map(preprocess_function, batched=True)
 
 # lora配置
 lora_config = LoraConfig(
