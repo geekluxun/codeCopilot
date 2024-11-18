@@ -1,5 +1,6 @@
 import math
 import os
+import sys
 
 import torch
 import wandb
@@ -10,8 +11,16 @@ from torch.multiprocessing import freeze_support
 from transformers import AutoTokenizer, TrainingArguments, AutoModelForCausalLM, DataCollatorWithPadding
 from transformers import Trainer
 
+print(f"Current working directory: {os.getcwd()}")
+print(f"Module search path: {sys.path}")
 # local modules
-from eval.measure import compute_metrics
+
+try:
+    from eval.measure import compute_metrics
+except ImportError as e:
+    print(f"ImportError: {e}")
+    sys.exit(1)
+
 from utils.monitor_util import ResourceMonitor
 
 # 使用数据集的百分比
@@ -20,18 +29,17 @@ use_datasets_percentage = 0.1
 use_test_datasets_percentage = 0.01
 # 序列长度
 sequence_max_length = 512
-# model_local_path = '/Users/luxun/workspace/ai/hf/models/Qwen1.5-0.5B'
-model_local_path = '/Users/luxun/workspace/ai/mine/codeCopilot/utils/lora-merged'
+model_local_path = '/Users/luxun/workspace/ai/hf/models/Qwen1.5-0.5B'
 dataset_local_path = '/Users/luxun/workspace/ai/hf/datasets/CodeAlpaca-20k'
 logging_dir = "output/logs/tensorboard"
 saved_model_path = 'output/models/CodeCopilot'
-checkpoint_path = 'output/checkpoints/'
+checkpoint_path = 'output/checkpoints/checkpoint-1'
 project_name = "CodeCopilot"
 
 # 环境设置
 os.environ["WANDB_MODE"] = "offline"
-os.environ["WANDB_DIR"] = "wandb_log"
-os.environ["WANDB_CACHE_DIR"] = "wandb_log"
+os.environ["WANDB_DIR"] = "tmp/wandb_log"
+os.environ["WANDB_CACHE_DIR"] = "tmp/wandb_log"
 
 
 # 配置设备
@@ -97,7 +105,7 @@ def train_model():
 
     # 预处理数据集
     train_dataset = train_val_dataset["train"].map(preprocess_data_function, batched=True)
-    val_dataset = train_val_dataset["demo"].map(preprocess_data_function, batched=True)
+    val_dataset = train_val_dataset["test"].map(preprocess_data_function, batched=True)
     print(f"train_dataset size: {len(train_dataset)}, val_dataset size: {len(val_dataset)}")
     # LoRA配置
     lora_config = LoraConfig(
@@ -120,9 +128,9 @@ def train_model():
         eval_accumulation_steps=1,  # 增加评估累积步数
         learning_rate=3e-5,
         evaluation_strategy="steps",
-        eval_steps=1,
+        eval_steps=4,
         save_strategy="steps",
-        save_steps=1,
+        save_steps=4,
         save_total_limit=3,
         logging_dir=logging_dir,
         log_level="debug",
@@ -169,13 +177,16 @@ def train_model():
         eval_dataset=val_dataset,
         data_collator=DataCollatorWithPadding(tokenizer=tokenizer),
         compute_metrics=compute_metrics,
-        # preprocess_logits_for_metrics=preprocess_logits_for_metrics
+        #preprocess_logits_for_metrics=preprocess_logits_for_metrics
     )
 
     # 开始训练
 
     print("Starting training...")
-    result = trainer.train(resume_from_checkpoint=checkpoint_path)
+    if is_exist_checkpoint(checkpoint_path):
+        result = trainer.train(resume_from_checkpoint=checkpoint_path)
+    else:
+        result = trainer.train()
     # 打印训练结果
     print("\nTraining completed!")
     print(f"Total training time: {result.metrics['train_runtime']:.2f} seconds")
@@ -194,6 +205,16 @@ def train_model():
     print("Saving model...")
     trainer.save_model(saved_model_path)
     print("Training completed!")
+
+
+def is_exist_checkpoint(directory):
+    if not os.path.isdir(directory):
+        return False
+    # 检查目录是否非空
+    for _, dirnames, filenames in os.walk(directory):
+        if dirnames or filenames:
+            return True
+    return False
 
 
 def log_train_arg(training_args: TrainingArguments, train_dataset_size: int):
